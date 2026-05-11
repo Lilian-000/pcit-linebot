@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "hono-line-bot-template",
+  "name": "pcit-linebot",
   "main": "src/index.ts",
   "compatibility_date": "2025-01-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -11,43 +11,52 @@
   // LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET should be set via
   // `wrangler secret put`, not in this file.
 
-  "vars": {
-    // 可在此放置非機敏的環境變數
-    // Place non-sensitive environment variables here
-    // "EXAMPLE_VAR": "value"
+  "vars": {},
+
+  // ── Workers AI: 用 gpt-oss-120b 生成防詐分析報告 ──
+  // 文件 / Docs: https://developers.cloudflare.com/workers-ai/models/gpt-oss-120b/
+  "ai": {
+    "binding": "AI"
+  },
+
+  // ── R2: 存任務狀態與分析結果 ──
+  // 建立 bucket（本機 dev 會自動模擬，無需先建立；雲端部署前才需要）：
+  //   npx wrangler r2 bucket create pcit-tasks
+  "r2_buckets": [
+    {
+      "binding": "TASK_BUCKET",
+      "bucket_name": "pcit-tasks"
+    }
+  ],
+
+  // ── Queue: 非同步處理 AI 任務 ──
+  // 建立 queue（本機 dev 會自動模擬，無需先建立；雲端部署前才需要）：
+  //   npx wrangler queues create pcit-tasks
+  // Cloudflare Queue 需要 Workers Paid 方案才能在 production 使用。
+  "queues": {
+    "producers": [
+      {
+        "binding": "TASK_QUEUE",
+        "queue": "pcit-tasks"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "pcit-tasks",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 0
+      }
+    ]
   }
 
-  // ─────────────────────────────────────────────────────────────────────
-  // 之後想擴充功能時，可取消註解對應的 binding（並補上 `,` 在 `vars` 後）。
-  // Uncomment the relevant binding below when you're ready to grow this bot.
-  // 完整文件 / Full docs: see README.md "Growing this template" section.
-  // ─────────────────────────────────────────────────────────────────────
-
-  // ── Workers AI（讓 bot 用 LLM 生成回覆 / let the bot reply with an LLM）──
-  // https://developers.cloudflare.com/workers-ai/
-  // "ai": {
-  //   "binding": "AI"
-  // }
-
-  // ── D1（SQLite — 儲存對話紀錄、使用者偏好 / chat history, user prefs）──
-  // https://developers.cloudflare.com/d1/
-  // 先建立 DB： npx wrangler d1 create <DB_NAME>
-  // 並把 database_id 填回此處
+  // ── 未來擴充用 binding（暫不啟用）──
+  // ── D1（SQLite — 儲存對話紀錄、使用者偏好）──
   // "d1_databases": [
   //   {
   //     "binding": "DB",
   //     "database_name": "<DB_NAME>",
-  //     "database_id": "<從 `wrangler d1 create` 輸出貼上 / paste from create output>"
-  //   }
-  // ]
-
-  // ── R2（物件儲存 — 收使用者上傳的圖片、語音 / store user uploads）──
-  // https://developers.cloudflare.com/r2/
-  // 先建立 bucket： npx wrangler r2 bucket create <BUCKET_NAME>
-  // "r2_buckets": [
-  //   {
-  //     "binding": "BUCKET",
-  //     "bucket_name": "<BUCKET_NAME>"
+  //     "database_id": "<從 `wrangler d1 create` 輸出貼上>"
   //   }
   // ]
 }

@@ -1,359 +1,230 @@
-# Hono LINE Bot Template (Cloudflare Workers)
+# PCIT LINE Bot — 防詐騙小幫手
 
-[華語](#華語) ｜ [English](#english)
+在 Cloudflare Workers 上實作的 LINE Messaging API bot，整合 Workers AI (`@cf/openai/gpt-oss-120b`) 提供「匯款前風險判斷／人頭戶自保／已受害申訴」三種情境的 AI 諮詢。
+
+> 詳細工程藍圖：[issue #2](https://github.com/Lilian-000/pcit-linebot/issues/2#issuecomment-4425768321)
 
 ---
 
-## 華語
-
-使用 [Hono](https://hono.dev/) 在 Cloudflare Workers 上實作 LINE Messaging API webhook 的最小範本。收到使用者文字訊息後，會透過 LINE Reply API 回覆 `Hello World!`。
-
-### 功能
-
-- 單一範例路由 `POST /webhook`
-- 以 HMAC-SHA256 驗證 `x-line-signature`，拒絕偽造請求
-- 解析 LINE webhook 事件，僅處理 `message` + `text`
-- 50 秒 replyToken 過期保護檢查
-- 透過 Cloudflare Secret 安全注入 `LINE_CHANNEL_ACCESS_TOKEN` 與 `LINE_CHANNEL_SECRET`
-
-### 專案結構
+## 架構總覽
 
 ```
-.
-├── src/index.ts        # Hono app 入口（含 /webhook 路由與簽章驗證）
-├── wrangler.jsonc      # Cloudflare Workers 設定（JSONC 格式）
-├── tsconfig.json
-├── package.json
-└── .dev.vars.example   # 本機開發環境變數範例
+LINE 使用者
+  │
+  ▼
+POST /line/webhook  ←─ 驗 x-line-signature
+  │
+  ├─ 產生 taskId + 寫入 R2（status=queued）
+  ├─ 送進 Cloudflare Queue
+  └─ Reply API 立刻回覆使用者：「請點 /tasks/:taskId 看結果」
+                                  │
+                                  ▼
+                  Queue consumer ──► gpt-oss-120b ──► 寫回 R2（status=done）
+                                  │
+                                  ▼
+       使用者打開 /tasks/:taskId（HTML 頁）── JS 每 5 秒輪詢 /api/tasks/:taskId
 ```
 
-### 開始使用
+這樣設計：
+- **不卡 Reply token**：webhook 在數百毫秒內回覆 LINE，不必等 AI 跑完
+- **不必用 Push API**：使用者自己打開結果頁，省 LINE 推播費用
+- **AI 處理可慢**：Queue consumer 沒有 webhook 的時限
+
+---
+
+## 路由
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| `POST` | `/line/webhook` | LINE webhook（驗簽 + 派工） |
+| `GET`  | `/tasks/:taskId` | 使用者實際看到的 HTML 結果頁（含 Markdown 渲染與輪詢） |
+| `GET`  | `/api/tasks/:taskId` | 前端輪詢用的 JSON 狀態 API |
+| `GET`  | `/test/health` | 健康檢查，回傳各 binding 是否註冊 |
+| `POST` | `/test/tasks` | 測試：跑完整非同步流程（免 LINE 簽章） |
+| `POST` | `/test/analyze-sync` | 測試：同步呼叫 AI，立即拿到 Markdown（debug prompt 用） |
+
+---
+
+## 專案結構
+
+```
+src/
+├── index.ts                  # Worker 入口（fetch + queue handler）
+├── types.ts                  # 共用型別（Bindings、TaskState、API response）
+├── consumer.ts               # Queue consumer：呼叫 AI 並寫回 R2
+├── lib/
+│   ├── line.ts              # LINE 簽章驗證 + Reply API
+│   ├── storage.ts           # R2 任務狀態 CRUD
+│   ├── ai.ts                # 包住 env.AI.run('@cf/openai/gpt-oss-120b', …)
+│   └── prompt.ts            # 訊息剖析 + AI prompt（可自訂）
+└── routes/
+    ├── webhook.ts           # POST /line/webhook
+    ├── tasks.ts             # /tasks/:taskId 與 /api/tasks/:taskId
+    └── test.ts              # 測試路由（不過 LINE）
+```
+
+每個檔案的重要函式都有中文註解，新工程師可從 `src/index.ts` → `routes/` → `lib/` 順著看。
+
+> **想改提示詞？** 直接編輯 `src/lib/prompt.ts` 內的 `SYSTEM_INSTRUCTIONS` 與 `buildPrompt()`，其他層完全不用動。
+> **想改訊息剖析？** 改 `parseUserMessage()`（同檔案）。
+
+---
+
+## 必要的 Cloudflare 設定
+
+| 種類 | 名稱 | 取得／建立方式 |
+| --- | --- | --- |
+| Secret | `LINE_CHANNEL_ACCESS_TOKEN` | LINE Developers Console → Messaging API → Issue long-lived token |
+| Secret | `LINE_CHANNEL_SECRET` | LINE Developers Console → Basic settings |
+| Binding | `AI` | Workers AI（無需建立資源） |
+| Binding | `TASK_BUCKET` | `npx wrangler r2 bucket create pcit-tasks` |
+| Binding | `TASK_QUEUE` | `npx wrangler queues create pcit-tasks`（需 Workers Paid 方案才能上 production） |
+
+> 本機 `wrangler dev` 會自動模擬 R2 與 Queue，**完全不需先建立雲端資源**，可立刻開測。
+
+---
+
+## 快速啟動（本機）
 
 ```bash
 # 1. 安裝依賴
 npm install
-```
 
-#### 本機開發
-
-前置作業：建立 `.dev.vars` 並填入 LINE 的 Channel access token 與 Channel secret（[詳細說明](#兩個必要的-secret)）。
-
-```bash
+# 2. 設定本機環境變數
 cp .dev.vars.example .dev.vars
-# 編輯 .dev.vars，填入實際值
+# 編輯 .dev.vars，填入實際 LINE token / secret
+#   （若只想跑 /test/* 路由，可以先填假值，但 /line/webhook 會回 401）
 
+# 3. 啟動 dev server（會同時跑 fetch + queue consumer）
 npm run dev
 ```
 
-#### 部署到 Cloudflare Workers
+預設會聽 `http://localhost:8787`。
 
-前置作業：
-
-1. **登入 Cloudflare**（首次執行 wrangler 時會自動開瀏覽器要求授權）：
-
-   ```bash
-   npx wrangler login
-   ```
-
-2. **設定兩個 Secret 到 Cloudflare 帳號**（生產環境不會讀 `.dev.vars`）：
-
-   ```bash
-   npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
-   npx wrangler secret put LINE_CHANNEL_SECRET
-   ```
-
-   每個指令會提示貼上值，按 Enter 完成。詳見 [兩個必要的 Secret](#兩個必要的-secret) 一節。
-
-   > 注意：Secret 是綁在「已部署的 Worker」上，所以實際上要先 `npm run deploy` 一次才能設定。第一次部署時 secret 還沒設，webhook 會回 `401`；設好後再部署或重新觸發即可。或者可先用 Dashboard 的 Variables and Secrets 頁面預先建立。
-
-3. 部署：
-
-   ```bash
-   npm run deploy
-   ```
-
-部署完成後，將顯示的 Worker URL 加上 `/webhook` 路徑（例如 `https://hono-line-bot-template.YOUR-SUBDOMAIN.workers.dev/webhook`）填入 LINE Developers Console 的「Webhook URL」欄位，並啟用 webhook。可在該頁面按 **Verify** 測試簽章驗證是否通過。
-
-### 兩個必要的 Secret
-
-| 名稱 | 用途 |
-| --- | --- |
-| `LINE_CHANNEL_ACCESS_TOKEN` | 呼叫 LINE Reply API 時的 Bearer token |
-| `LINE_CHANNEL_SECRET` | 驗證 webhook 請求簽章（HMAC-SHA256 金鑰） |
-
-兩者皆屬於機敏資訊，**不可** 寫入 `wrangler.jsonc` 或提交至版本控制。請使用 Cloudflare Workers 的 Secret 機制：
-
-#### 方法 1：使用 `wrangler secret put`（推薦）
-
-```bash
-npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
-npx wrangler secret put LINE_CHANNEL_SECRET
-```
-
-每次執行都會提示輸入值，按 Enter 即可。Cloudflare 會將其加密儲存，並在 Worker 執行時以 `env.LINE_CHANNEL_ACCESS_TOKEN` / `env.LINE_CHANNEL_SECRET`（在 Hono 中為 `c.env.LINE_CHANNEL_ACCESS_TOKEN` / `c.env.LINE_CHANNEL_SECRET`）注入。
-
-確認已設定：
-
-```bash
-npx wrangler secret list
-```
-
-更新 secret：再執行一次 `wrangler secret put` 即可覆寫。
-
-刪除：
-
-```bash
-npx wrangler secret delete LINE_CHANNEL_ACCESS_TOKEN
-```
-
-#### 方法 2：使用 Cloudflare Dashboard
-
-1. 前往 [Cloudflare Dashboard](https://dash.cloudflare.com/) → Workers & Pages
-2. 選擇對應的 Worker → Settings → **Variables and Secrets**
-3. 點擊 **Add variable**，Type 選 **Secret**
-4. 分別新增 `LINE_CHANNEL_ACCESS_TOKEN` 與 `LINE_CHANNEL_SECRET`
-5. 儲存
-
-#### 本機開發（`.dev.vars`）
-
-`wrangler dev` 會讀取專案根目錄的 `.dev.vars` 檔案作為本機 secret：
-
-```bash
-cp .dev.vars.example .dev.vars
-# 編輯 .dev.vars，填入實際 token 與 secret
-```
-
-`.dev.vars` 已被 `.gitignore` 排除，不會被提交。
-
-### 取得 LINE Channel Access Token 與 Channel Secret
-
-1. 至 [LINE Developers Console](https://developers.line.biz/) 建立 Provider 與 Messaging API Channel
-2. **Channel secret**：於 Channel 的「Basic settings」頁籤可看到（複製即可）
-3. **Channel access token**：於「Messaging API」頁籤底部，發行（Issue）一組 **Channel access token (long-lived)**
-
-### 簽章驗證原理
-
-LINE 平台會用你的 Channel secret 對 raw request body 計算 HMAC-SHA256，再以 Base64 編碼放入 `x-line-signature` header。Worker 收到請求時會用同一把金鑰重新計算，並以等長時間比較。簽章不符（含缺少 header）時會回 `401 Invalid signature`。
-
-> 在 LINE Developers Console 的「Webhook settings」可按 **Verify** 測試你的端點是否能通過簽章驗證。
-
-### 測試
-
-從 LINE App 直接傳訊息給 bot 是最可靠的方式。若要用 `curl` 測試，需自行計算正確簽章；以 raw body `{}` 為例：
-
-```bash
-SECRET="your-channel-secret"
-BODY='{"events":[]}'
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -binary | base64)
-
-curl -X POST https://YOUR-WORKER-URL/webhook \
-  -H "Content-Type: application/json" \
-  -H "x-line-signature: $SIG" \
-  -d "$BODY"
-```
-
-> 注意：上述 `events` 為空陣列時 Worker 會回 `200 OK`。若塞入假的 `replyToken` 真的呼叫 Reply API，LINE 會回 400，Worker 端則回 `502 LINE API error`。
-
-### 進階擴充：Workers AI / D1 / R2
-
-`wrangler.jsonc` 底部已預先放了三組註解掉的 binding，未來想長大時直接取消註解即可。常見搭配場景：
-
-| 服務 | 在 LINE bot 的典型用途 | 文件 |
-| --- | --- | --- |
-| **Workers AI** | 用 LLM 生成回覆、做意圖分類、翻譯、影像辨識 | <https://developers.cloudflare.com/workers-ai/> |
-| **D1**（SQLite） | 儲存對話歷史、使用者偏好、群組設定、配額計數 | <https://developers.cloudflare.com/d1/> |
-| **R2**（物件儲存） | 收使用者上傳的圖片 / 音訊，或快取 LINE content API 抓回的多媒體 | <https://developers.cloudflare.com/r2/> |
-
-啟用後在 Hono 中可直接使用：
-
-```ts
-type Bindings = {
-  LINE_CHANNEL_ACCESS_TOKEN: string
-  LINE_CHANNEL_SECRET: string
-  AI: Ai                     // Workers AI
-  DB: D1Database             // D1
-  BUCKET: R2Bucket           // R2
-}
-```
-
-### 授權
-
-本專案以 [MIT License](LICENSE) 釋出，可自由用於個人或商業用途。
+> **多個 Cloudflare 帳號？** Workers AI 在 dev 模式必須遠端代理到 Cloudflare 才能跑，若你 `wrangler login` 過多個帳號，會看到 `More than one account available` 錯誤。請先用 `npx wrangler whoami` 找到目標帳號 ID，然後：
+>
+> ```bash
+> CLOUDFLARE_ACCOUNT_ID=xxxxxxxx npm run dev
+> ```
+>
+> 或把 `CLOUDFLARE_ACCOUNT_ID=...` 加進 `.dev.vars`（已被 gitignore）。
 
 ---
 
-## English
+## 測試方式
 
-A minimal template implementing a LINE Messaging API webhook on Cloudflare Workers using [Hono](https://hono.dev/). When a user sends a text message, it replies with `Hello World!` via the LINE Reply API.
-
-### Features
-
-- Single example route `POST /webhook`
-- HMAC-SHA256 verification of `x-line-signature` to reject forged requests
-- Parses LINE webhook events; handles only `message` + `text`
-- 50-second replyToken expiry guard
-- `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_CHANNEL_SECRET` injected securely via Cloudflare Secrets
-
-### Project structure
-
-```
-.
-├── src/index.ts        # Hono app entry (route + signature verification)
-├── wrangler.jsonc      # Cloudflare Workers config (JSONC)
-├── tsconfig.json
-├── package.json
-└── .dev.vars.example   # Example local dev environment variables
-```
-
-### Getting started
+### A. 健康檢查（無依賴）
 
 ```bash
-# 1. Install dependencies
-npm install
+curl http://localhost:8787/test/health
 ```
 
-#### Run locally
+預期回應：
 
-Prerequisite: create `.dev.vars` with your LINE channel access token and channel secret (see [Two required secrets](#two-required-secrets)).
+```json
+{
+  "ok": true,
+  "bindings": { "AI": true, "TASK_BUCKET": true, "TASK_QUEUE": true },
+  "now": 1710000000000
+}
+```
+
+若有任何 binding 是 `false`，請檢查 `wrangler.jsonc` 是否完整。
+
+### B. 同步測試 prompt（最快迭代方式，會打到 Cloudflare AI）
 
 ```bash
-cp .dev.vars.example .dev.vars
-# Edit .dev.vars and paste real values
-
-npm run dev
+curl -X POST http://localhost:8787/test/analyze-sync \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"我在臉書社團看到有人賣便宜的演唱會門票，賣家叫我先匯款 6000 元到他的個人帳戶，這樣安全嗎？"}'
 ```
 
-#### Deploy to Cloudflare Workers
+回應會包含：
 
-Prerequisites:
+```json
+{
+  "markdown": "## 角色判斷\n您屬於「匯款人 — 預防詐騙」……",
+  "elapsedMs": 8421
+}
+```
 
-1. **Authenticate with Cloudflare** (the first wrangler command opens a browser for OAuth):
+要調整 prompt 風格、口吻、輸出格式 → 改 `src/lib/prompt.ts` 後重存檔，`wrangler dev` 會熱重載。
 
-   ```bash
-   npx wrangler login
-   ```
-
-2. **Upload both secrets to your Cloudflare account** (production does *not* read `.dev.vars`):
-
-   ```bash
-   npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
-   npx wrangler secret put LINE_CHANNEL_SECRET
-   ```
-
-   Each prompts for the value — paste and press Enter. See [Two required secrets](#two-required-secrets) for details.
-
-   > Note: secrets are attached to a *deployed* Worker, so in practice you'll `npm run deploy` once first; until the secrets are set, webhook calls will return `401`. After setting them, redeploy or just retrigger. Alternatively you can pre-create them via the Dashboard's Variables and Secrets page.
-
-3. Deploy:
-
-   ```bash
-   npm run deploy
-   ```
-
-After deploy, take the printed Worker URL, append `/webhook` (e.g. `https://hono-line-bot-template.YOUR-SUBDOMAIN.workers.dev/webhook`), and paste it into the **Webhook URL** field of your LINE Developers Console channel. Enable the webhook. Click **Verify** on that page to confirm signature verification works end-to-end.
-
-### Two required secrets
-
-| Name | Purpose |
-| --- | --- |
-| `LINE_CHANNEL_ACCESS_TOKEN` | Bearer token used when calling the LINE Reply API |
-| `LINE_CHANNEL_SECRET` | HMAC-SHA256 key used to verify webhook request signatures |
-
-Both are sensitive — **do not** put them in `wrangler.jsonc` or commit them. Use Cloudflare Workers' Secret mechanism:
-
-#### Option 1: `wrangler secret put` (recommended)
+### C. 完整非同步流程（模擬 LINE webhook 行為，不需簽章）
 
 ```bash
-npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
-npx wrangler secret put LINE_CHANNEL_SECRET
+# 1. 建立任務
+curl -X POST http://localhost:8787/test/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"我前天匯了 30000 元給網拍賣家，現在他封鎖我，怎麼辦？"}'
 ```
 
-Each command prompts for the value. Cloudflare stores it encrypted and injects it at runtime as `env.LINE_CHANNEL_ACCESS_TOKEN` / `env.LINE_CHANNEL_SECRET` (in Hono: `c.env.LINE_CHANNEL_ACCESS_TOKEN` / `c.env.LINE_CHANNEL_SECRET`).
+回應：
 
-Verify:
+```json
+{
+  "taskId": "f1a2b3c4-...",
+  "resultUrl": "http://localhost:8787/tasks/f1a2b3c4-...",
+  "statusUrl": "/api/tasks/f1a2b3c4-..."
+}
+```
 
 ```bash
-npx wrangler secret list
+# 2. 用瀏覽器打開 resultUrl，會看到「處理中……」並自動每 5 秒輪詢
+open "http://localhost:8787/tasks/f1a2b3c4-..."
+
+# 或用 curl 看 JSON 狀態
+curl http://localhost:8787/api/tasks/f1a2b3c4-...
 ```
 
-To update, re-run `wrangler secret put` — it overwrites.
+`status` 會從 `queued` → `processing` → `done`，完成後 `resultMarkdown` 會出現在回應中（也會在瀏覽器頁面渲染成 Markdown）。
 
-To delete:
+### D. 真正用 LINE App 測試
 
-```bash
-npx wrangler secret delete LINE_CHANNEL_ACCESS_TOKEN
-```
+1. 在 `.dev.vars` 填入真實 token/secret 後 `npm run deploy`
+2. 把部署後的 URL `https://YOUR-WORKER.workers.dev/line/webhook` 貼到 LINE Developers Console → Webhook URL
+3. 按 **Verify**，應顯示 `Success`
+4. 加 bot 為好友後直接傳訊息，bot 會回一個分析結果頁的連結
 
-#### Option 2: Cloudflare Dashboard
-
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/) → Workers & Pages
-2. Select the Worker → Settings → **Variables and Secrets**
-3. Click **Add variable**, set Type to **Secret**
-4. Add both `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_CHANNEL_SECRET`
-5. Save
-
-#### Local development (`.dev.vars`)
-
-`wrangler dev` reads `.dev.vars` from the project root as local secrets:
-
-```bash
-cp .dev.vars.example .dev.vars
-# Edit .dev.vars and paste the real token + secret
-```
-
-`.dev.vars` is gitignored.
-
-### Getting your LINE Channel access token and Channel secret
-
-1. Open [LINE Developers Console](https://developers.line.biz/) and create a Provider + Messaging API Channel
-2. **Channel secret**: shown on the channel's **Basic settings** tab — copy it
-3. **Channel access token**: on the **Messaging API** tab, scroll to the bottom and **Issue** a long-lived **Channel access token**
-
-### How signature verification works
-
-LINE computes HMAC-SHA256 over the raw request body using your Channel secret, Base64-encodes it, and sends it in the `x-line-signature` header. The Worker recomputes the MAC with the same key and compares them in constant time. Mismatches (including a missing header) return `401 Invalid signature`.
-
-> In the LINE Developers Console's **Webhook settings**, click **Verify** to test that your endpoint accepts a properly-signed request.
-
-### Testing
-
-Sending a real message from the LINE app is the most reliable test. To test with `curl`, you need to compute a valid signature. Example with an empty events body:
+### E. 自行計算簽章測試 `/line/webhook`
 
 ```bash
 SECRET="your-channel-secret"
-BODY='{"events":[]}'
+BODY='{"events":[{"type":"message","replyToken":"FAKE","timestamp":'$(($(date +%s)*1000))',"source":{"type":"user","userId":"U1"},"message":{"type":"text","text":"哈囉"}}]}'
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -binary | base64)
 
-curl -X POST https://YOUR-WORKER-URL/webhook \
+curl -X POST http://localhost:8787/line/webhook \
   -H "Content-Type: application/json" \
   -H "x-line-signature: $SIG" \
   -d "$BODY"
 ```
 
-> An empty `events` array returns `200 OK`. If you fake a `replyToken` and actually hit the Reply API, LINE will return 400 and the Worker responds with `502 LINE API error`.
+> Reply API 那一段會打到真實 LINE 平台，假 `replyToken` 會被回 400，Worker 端 log 會印錯誤但仍回 200（避免 LINE 重送）。建議用真實 LINE 訊息或上面的 `/test/tasks` 才能看到完整流程。
 
-### Growing this template: Workers AI / D1 / R2
+---
 
-The bottom of `wrangler.jsonc` ships with three commented-out bindings — uncomment the one you need. Typical pairings for a LINE bot:
+## 部署到 Cloudflare
 
-| Service | Typical use in a LINE bot | Docs |
-| --- | --- | --- |
-| **Workers AI** | LLM-generated replies, intent classification, translation, image recognition | <https://developers.cloudflare.com/workers-ai/> |
-| **D1** (SQLite) | Conversation history, user preferences, group settings, quota counters | <https://developers.cloudflare.com/d1/> |
-| **R2** (object storage) | User-uploaded images/audio, or caching media fetched from the LINE content API | <https://developers.cloudflare.com/r2/> |
+```bash
+# 1. 登入
+npx wrangler login
 
-Once enabled, use them from Hono directly:
+# 2. 建立 R2 bucket 與 Queue（一次即可）
+npx wrangler r2 bucket create pcit-tasks
+npx wrangler queues create pcit-tasks
 
-```ts
-type Bindings = {
-  LINE_CHANNEL_ACCESS_TOKEN: string
-  LINE_CHANNEL_SECRET: string
-  AI: Ai                     // Workers AI
-  DB: D1Database             // D1
-  BUCKET: R2Bucket           // R2
-}
+# 3. 設定 Secret
+npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
+npx wrangler secret put LINE_CHANNEL_SECRET
+
+# 4. 部署
+npm run deploy
 ```
 
-### License
+> **注意**：Cloudflare Queue 需要 Workers **Paid** 方案。
 
-Released under the [MIT License](LICENSE) — free to use for personal or commercial projects.
+---
+
+## 授權
+
+[MIT License](LICENSE)
