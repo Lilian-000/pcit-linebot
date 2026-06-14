@@ -1,4 +1,4 @@
-# PCIT LINE Bot — 防詐騙小幫手
+# PCIT LINE Bot — 帳戶安全守護者
 
 在 Cloudflare Workers 上實作的 LINE Messaging API bot，整合 Workers AI (`@cf/openai/gpt-oss-120b`) 提供「匯款前風險判斷／人頭戶自保／已受害申訴」三種情境的 AI 諮詢。
 
